@@ -5,10 +5,14 @@ class BasicClusterAttributeParts:
     """
     Produces the byte sequences for a Read Attributes Response Command, including the attribute identifier, status, data type, and value
     """
-    def __init__(self, model_identifier, manufacturer_name="ARC12"):
+    cluster_id = b'\x00\x00'
+    supported_attributes = (b'\x00\x00', b'\x00\x04', b'\x00\x05', b'\x00\x07', b'\x40\x00')
+
+    def __init__(self, model_identifier, manufacturer_name="ARC12", sw_build="test-build"):
         # TODO allow more customisation here.
         self.model_identifier = model_identifier
         self.manufacturer_name = manufacturer_name
+        self.sw_build = sw_build
 
     def get_part(self, attribute_id):
         """
@@ -41,8 +45,44 @@ class BasicClusterAttributeParts:
         #     pass
         elif attribute_id == b'\x00\x07':  # PowerSource. This is mandatory!
             part = attribute_id_le + b'\x00' + b'\x30' + b'\x03'  # last byte 0x00 means "unknown", 0x03 means "battery"
-        # elif attribute_id == b'\x40\x00':  # SWBuildID
-        #     pass
+        elif attribute_id == b'\x40\x00':  # SWBuildID is optional according to Zigbee spec but Z2M logs an error without (although it is not breaking)
+            part = attribute_id_le + b'\x00' + zcl_string(self.sw_build)
+
+        return part
+
+
+class OnOffReadAttributeParts:
+    """
+    Produces the byte sequences for a Read Attributes Response Command, including the attribute identifier, status, data type, and value
+    """
+    cluster_id = b'\x00\x06'
+    supported_attributes = (b'\x00\x00',  # on/off
+                            )
+
+    def __init__(self, on_off_state):
+        """
+
+        :param on_off_state: True of on
+        :type on_off_state: boolean
+        """
+        self.on_off_state = on_off_state
+
+    def get_part(self, attribute_id):
+        """
+
+        :param attribute_id: big-endian attribute id
+        :type attribute_id: bytes
+        :return:
+        """
+
+        # we need the little-endian form for response messages, while working with big-endian for user-facing and Python API parameters
+        attribute_id_le = attribute_id[::-1]
+
+        # Default = use a status of 0x86, which means UNSUPPORTED_ATTRIBUTE and include no value
+        part = attribute_id_le + b'\x86'
+
+        if attribute_id == b'\x00\x00':
+            part = attribute_id_le + b'\x10' + self.on_off_state.to_bytes(1, "big")  # data type 0x10 is boolean
 
         return part
 
@@ -141,9 +181,40 @@ class ZclFrameReadAttributesResponse(ZclFrameResponse):
         self.variables = [cluster_provider.get_part(a) for a in response_to.attribute_ids]
 
 
+class ZclFrameReport(ZclFrameResponse):
+    """
+    Creates report ZCL (very similar to response to read-attributes command)
+    """
+    def __init__(self, cluster_provider, sequence_no):
+        """
+
+        :param cluster_provider: object with get_part(attribute_id) method, which will generate the data parts for the response
+        """
+        super(ZclFrameReport, self).__init__(b'\x18', sequence_no.to_bytes(1, "big"), b'\x0a')
+
+        self.variables = [cluster_provider.get_part(a) for a in cluster_provider.supported_attributes]
+
+
+class ZclFrameDefaultResponse(ZclFrameResponse):
+    """
+    Creates a response to local command
+    """
+    def __init__(self, response_to):
+        """
+
+        :param response_to: ZCL command frame object (subclass of ZclFrameCommand)
+        :type response_to: ZclFrameReadAttributes
+        """
+        super(ZclFrameDefaultResponse, self).__init__(b'\x18', response_to.trans_seq_no, b'\x0b')  # fixed FCF; 0x0b is "default response"
+
+        self.variables = [response_to.zcl_command, b'\x00']  # the body of the default response ZCL is the command which was sent + a success flag
+
+
 class AfIncomingMessage:
     """
     AF_INCOMING_MESSAGE is Simple API
+    This will handle both attribute requests and "local/cluster-specific" commands (have no attributes), in spite of the use of ZclFrameReadAttributes
+    for self.zcl (in the local case, this is an empty list for messages I've seen so far).
     """
     def __init__(self, f):
         """
@@ -254,7 +325,7 @@ def send_and_await_response(s, msg, prepend_sof=True, append_fcs=True, print_msg
 
     f = ZnpFrameBody(s)
     if print_msg:
-        print("RX body =", f)
+        print("[Response] RX body:", f)
 
     return f
 
@@ -272,7 +343,7 @@ def send_and_check_success(s, msg, response_command_id, prepend_sof=True, append
     """
     # wait for response and return boolean
     f = send_and_await_response(s, msg, prepend_sof, append_fcs,  print_msg)
-    return f.command == response_command_id and f.data == b'\x00'  # 1 data byte = 0x00 for "success"
+    return (f.command == response_command_id) and (f.data == b'\x00')  # 1 data byte = 0x00 for "success"
 
 
 def zb_write_configuration(s, config_id, value, print_msg=False):
