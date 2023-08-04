@@ -45,7 +45,9 @@ class BasicClusterAttributeParts:
         #     pass
         elif attribute_id == b'\x00\x07':  # PowerSource. This is mandatory!
             part = attribute_id_le + b'\x00' + b'\x30' + b'\x03'  # last byte 0x00 means "unknown", 0x03 means "battery"
-        elif attribute_id == b'\x40\x00':  # SWBuildID is optional according to Zigbee spec but Z2M logs an error without (although it is not breaking)
+        # SWBuildID is optional according to Zigbee spec but Z2M logs an error without (although it is not breaking)
+        # This might arise because the converter JS contains: "await endpoint.read('genBasic', ['modelId', 'swBuildId', 'powerSource']);"
+        elif attribute_id == b'\x40\x00':
             part = attribute_id_le + b'\x00' + zcl_string(self.sw_build)
 
         return part
@@ -59,13 +61,15 @@ class OnOffReadAttributeParts:
     supported_attributes = (b'\x00\x00',  # on/off
                             )
 
-    def __init__(self, on_off_state):
+    def __init__(self, on_off_state, for_report=False):
         """
 
         :param on_off_state: True of on
         :type on_off_state: boolean
+        :param for_report: True if for report. this affects the "variable" component of ZCL. Reports do not have the status byte. Attr request responses DO
         """
         self.on_off_state = on_off_state
+        self.for_report = for_report
 
     def get_part(self, attribute_id):
         """
@@ -74,6 +78,7 @@ class OnOffReadAttributeParts:
         :type attribute_id: bytes
         :return:
         """
+        status_byte = b'' if self.for_report else b'\x00'  # success
 
         # we need the little-endian form for response messages, while working with big-endian for user-facing and Python API parameters
         attribute_id_le = attribute_id[::-1]
@@ -82,7 +87,7 @@ class OnOffReadAttributeParts:
         part = attribute_id_le + b'\x86'
 
         if attribute_id == b'\x00\x00':
-            part = attribute_id_le + b'\x10' + self.on_off_state.to_bytes(1, "big")  # data type 0x10 is boolean
+            part = attribute_id_le + status_byte + b'\x10' + self.on_off_state.to_bytes(1, "big")  # data type 0x10 is boolean
 
         return part
 
@@ -328,6 +333,20 @@ def send_and_await_response(s, msg, prepend_sof=True, append_fcs=True, print_msg
         print("[Response] RX body:", f)
 
     return f
+
+
+def send_report(s, endpoint, cluster_provider, report_seq_no, print_msg=False):
+    epb = endpoint.to_bytes(1, "big")
+    zcl = ZclFrameReport(cluster_provider, report_seq_no)
+    data = zcl.zcl_message()
+    # AF_DATA_REQUEST 0x2401 as for replies to attribute request, but without an "in" object to provide parameters
+    out_msg = (10 + len(data)).to_bytes(length=1, byteorder="big") + b'\x24\x01' + \
+        b'\x00\x00' + epb + epb + cluster_provider.cluster_id[::-1] + zcl.trans_seq_no + b'\x00' + b'\x10' + \
+        len(data).to_bytes(length=1, byteorder="big") + data
+    rsp_success = send_and_check_success(s, out_msg, b'\x64\x01', print_msg=print_msg)
+    if print_msg:
+        print("AF_DATA_REQUEST_RSP (for report) success?", rsp_success)
+    return rsp_success
 
 
 def send_and_check_success(s, msg, response_command_id, prepend_sof=True, append_fcs=True,  print_msg=False):

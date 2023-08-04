@@ -62,7 +62,23 @@ if do_setup:
 
     # ---------- Register the device and define the clusters. There is an alternative command in the Simple API. IDs here are big-endian
     znp.af_register(S,
-                    endpoint=b'\x01',  # A single endpoint is being used, 1
+                    endpoint=b'\x01',
+                    app_prof_id=b'\x01\x04',  # Home Automation Profile (prescribed) = 260 decimal
+                    app_device_id=b'\x00\x00',  # Device ID also in the HA Profile spec - this is the On/Off switch Id
+                    app_dev_ver=b'\x01',  # I think the device version is not prescribed
+                    in_cluster_ids=(  # this is a tuple
+                        b'\x00\x00',  # Basic Cluster, which is device info such as name, manufacturer etc
+                        b'\x00\x06'  # Make the switch also remote-controllable. This changes the switch state.
+                    ),
+                    out_cluster_ids=(  # this is a tuple
+                        b'\x00\x06',  # On/Off switch is in output cluster list and so is a "client". This is the switch state, which is reported on change
+                        #  b'\x00\x12',  # This is a "Multistate" (vs plain on/off id of 0x0006), for which reports would use attribute 0x0055
+                    ),
+                    print_msg=True
+                    )
+    # a second endpoint for the LED, since it also has a switch output cluster to report state
+    znp.af_register(S,
+                    endpoint=b'\x02',
                     app_prof_id=b'\x01\x04',  # Home Automation Profile (prescribed) = 260 decimal
                     app_device_id=b'\x00\x00',  # Device ID also in the HA Profile spec - this is the On/Off switch Id
                     app_dev_ver=b'\x01',  # I think the device version is not prescribed
@@ -75,7 +91,6 @@ if do_setup:
                         # PTVO GPIO LED also has an out cluster id 0x0006, which reports its state periodically (interval set in PTVO app), and this would
                         # presumably cover the case where there is an on/off switch on the device itself as well as remote control of the LED
                         b'\x00\x06',
-                        #  b'\x00\x12',  # On/Off switch is in output cluster list and so is a "client". This is actually a "Multistate". Plain on/off would be 0x0006
                     ),
                     print_msg=True
                     )
@@ -84,7 +99,7 @@ if do_setup:
     # there are 2 options (and it is to be determined whether these can be mixed (simple/not) with the register api call used:
     # - ZB_START_REQUEST (0x2600) [Simple API], which takes no parameters and returns a plain (no data) ZB_START_REQUEST_RSP (0x6600) immediately, and
     # - ZDO_STARTUP_FROM_APP, which takes a parameter and returns a RSP with a network state byte
-    input("MAKE SURE Zigbee2MQTT is accepting join requests and then hit any key. (Otherwise you get status=2 INVALID_PARAMETER from ZDO_STATE_CHANGE_IND)")
+    input("MAKE SURE Zigbee2MQTT is accepting join requests and then hit any key. (Otherwise you get status=2 [searching for PAN] from ZDO_STATE_CHANGE_IND)")
     fr = znp.send_and_await_response(S,
                                      b'\x01\x25\x40\x00',  # ZDO_STARTUP_FROM_APP with 0 delay
                                      print_msg=True)  # this should cause a response 0x6540 with network state code + multiple ZDO_STATE_CHANGE_IND
@@ -110,13 +125,15 @@ if do_setup:
 
 # ------------- THIS IS WHERE Z2M Starts its interview, issuing multiple AF_INCOMING_MSG
 running = True
-# set up for reporting events at 10s intervals and change events at 7s intervals
+# set up for reporting events at 10s intervals, LED change events at 7s intervals, and sw change events at 12s
 from time import time
 last_time_report = int(time() // 10) % 2
-last_time_event = int(time() // 7) % 2
+last_time_led_event = int(time() // 7) % 2
+last_time_sw_event = int(time() // 12) % 2
 report_seq_no = 0
 # device state variables
-device_output_onoff = False  # LED off
+led_state_onoff = False  # LED off
+sw_state_onoff = False  # plain switch off
 while running:
     # check for incoming messages which correspond to the Z2M "interview"
     if S.inWaiting():
@@ -137,9 +154,18 @@ while running:
                 # also 0x01 indicates the default repsonse is not disabled. Ideally, this should be treated properly, but path of least action...
                 print("Local/specific command to cluster", in_msg.cluster_id.hex())
                 if in_msg.cluster_id == b'\x00\x06':
+                    ep = in_msg.dst_endpoint[0]
                     # on/off commands are very simple. ZCL will have FCF=0x01 + the sequence + either 0x01 or 0x00 for "on" or "off"
-                    device_output_onoff = bool(in_msg.zcl.zcl_command[0])
-                    print("=> device set to:  " + ("on" if device_output_onoff else "off"))
+                    set_state = bool(in_msg.zcl.zcl_command[0])
+                    if ep == 1:
+                        sw_state_onoff = set_state
+                    elif ep == 2:
+                        led_state_onoff = set_state
+                    else:
+                        print(print(f"Bad endpoint {ep}"))
+                        continue
+
+                    print(f"=> device on endpoint {ep} set to:  " + ("on" if set_state else "off"))
                     # response
                     data = znp.ZclFrameDefaultResponse(response_to=in_msg.zcl).zcl_message()
                 else:
@@ -148,12 +174,15 @@ while running:
 
             elif in_msg.zcl.zcl_command == b'\x00':  # Read Attributes
                 print("ZCL Command = read attributes (0x00)")
+                cluster_provider = None
                 if in_msg.cluster_id == b'\x00\x00':
                     cluster_provider = znp.BasicClusterAttributeParts(model_identifier="ZNP-Test")
                 elif in_msg.cluster_id == b'\x00\x06':
-                    cluster_provider = znp.OnOffReadAttributeParts(device_output_onoff)
-                else:
-                    cluster_provider = None
+                    # this cluster is on two endpoints ([0] gets int value of first and only byte), so:
+                    if in_msg.dst_endpoint[0] == 1:  # plain switch
+                        cluster_provider = znp.OnOffReadAttributeParts(sw_state_onoff)
+                    elif in_msg.dst_endpoint[0] == 2:  # LED state
+                        cluster_provider = znp.OnOffReadAttributeParts(led_state_onoff)                    
 
                 if cluster_provider is None:
                     print("Unsupported cluster {}; cannot respond".format(in_msg.cluster_id.hex()))
@@ -169,31 +198,41 @@ while running:
             rsp_success = znp.send_and_check_success(S, out_msg, b'\x64\x01', print_msg=True)
             print("AF_DATA_REQUEST_RSP success?", rsp_success)  # ALSO likely to be AF_DATA_CONFIRM for request, in addition to AF_DATA_REQUEST response
         else:
-            print("Unexpected message")
-            print("RX body:", f)
+            print("Unexpected message received:", f)
 
     # output event or make report
     time_report = int(time() // 10) % 2
-    time_event = int(time() // 7) % 2
     if time_report != last_time_report:
         last_time_report = time_report
-        print("Sending periodic report (AF_DATA_REQUEST)")
+        print("Sending periodic report (AF_DATA_REQUEST) for endpoint 2 (LED)")
         # Only cluster 0x0006 but also note that these reports include LQI (as part of the metadata), which shows up in Z2M. No reports = no LQI!
-        cluster_provider = znp.OnOffReadAttributeParts(device_output_onoff)
-        zcl = znp.ZclFrameReport(cluster_provider, report_seq_no)
-        data = zcl.zcl_message()
-        # AF_DATA_REQUEST 0x2401 again, but without an "in" object to provide parameters
-        fixed_endpoint = b'\x01'
-        out_msg = (10 + len(data)).to_bytes(length=1, byteorder="big") + b'\x24\x01' + \
-            b'\x00\x00' + fixed_endpoint + fixed_endpoint + cluster_provider.cluster_id[::-1] + zcl.trans_seq_no + b'\x00' + b'\x10' + \
-            len(data).to_bytes(length=1, byteorder="big") + data
-        rsp_success = znp.send_and_check_success(S, out_msg, b'\x64\x01', print_msg=True)
-        print("AF_DATA_REQUEST_RSP success?", rsp_success)
+        cluster_provider = znp.OnOffReadAttributeParts(led_state_onoff, for_report=True)
+        znp.send_report(S, 2, cluster_provider, report_seq_no, print_msg=True)  # endpoint 2
+        # zcl = znp.ZclFrameReport(cluster_provider, report_seq_no)
+        # data = zcl.zcl_message()
+        # # AF_DATA_REQUEST 0x2401 again, but without an "in" object to provide parameters
+        # fixed_endpoint = b'\x01'
+        # out_msg = (10 + len(data)).to_bytes(length=1, byteorder="big") + b'\x24\x01' + \
+        #     b'\x00\x00' + fixed_endpoint + fixed_endpoint + cluster_provider.cluster_id[::-1] + zcl.trans_seq_no + b'\x00' + b'\x10' + \
+        #     len(data).to_bytes(length=1, byteorder="big") + data
+        # rsp_success = znp.send_and_check_success(S, out_msg, b'\x64\x01', print_msg=True)
+        # print("AF_DATA_REQUEST_RSP success?", rsp_success)
         report_seq_no += 1
 
-    if time_event != last_time_event:
-        last_time_event = time_event
-        device_output_onoff = not device_output_onoff
-        print("Device changed to:  " + ("on" if device_output_onoff else "off"))
+    time_led_event = int(time() // 7) % 2
+    if time_led_event != last_time_led_event:
+        last_time_led_event = time_led_event
+        led_state_onoff = not led_state_onoff
+        print("LED changed to:  " + ("on" if led_state_onoff else "off"))
+
+    time_sw_event = int(time() // 12) % 2
+    if time_sw_event != last_time_sw_event:
+        last_time_sw_event = time_sw_event
+        sw_state_onoff = not sw_state_onoff
+        print("Sw changed to:  " + ("on" if sw_state_onoff else "off"))
+        # the switch reports each state change (on and off) when they happen. (see above, there is no periodic report for endpoint 1)
+        cluster_provider = znp.OnOffReadAttributeParts(sw_state_onoff, for_report=True)
+        znp.send_report(S, 1, cluster_provider, report_seq_no, print_msg=True)  # endpoint 1
+        report_seq_no += 1
 
 S.close()
