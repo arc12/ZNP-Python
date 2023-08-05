@@ -1,5 +1,24 @@
 from serial import Serial
 
+# ZNP message command ids
+ZB_SYSTEM_RESET = b'\x46\x09'
+SYS_RESET_IND = b'\x41\x80'
+
+ZB_WRITE_CONFIGURATION = b'\x26\x05'
+ZB_WRITE_CONFIGURATION_RSP = b'\x66\x05'
+
+ZDO_STARTUP_FROM_APP = b'\x25\x40'
+ZDO_STARTUP_FROM_APP_RSP = b'\x65\x40'
+ZDO_STATE_CHANGE_IND = b'\x45\xC0'
+
+AF_REGISTER = b'\x24\x00'
+AF_REGISTER_RSP = b'\x64\x00'
+
+AF_INCOMING_MSG = b'\x44\x81'
+
+AF_DATA_REQUEST = b'\x24\x01'
+AF_DATA_REQUEST_RSP = b'\x64\x01'
+
 
 class BasicClusterAttributeParts:
     """
@@ -55,7 +74,8 @@ class BasicClusterAttributeParts:
 
 class OnOffReadAttributeParts:
     """
-    Produces the byte sequences for a Read Attributes Response Command, including the attribute identifier, status, data type, and value
+    Produces the byte sequences for a Read Attributes Response Command, including the attribute identifier, status, data type, and value.
+    Also for period reports.
     """
     cluster_id = b'\x00\x06'
     supported_attributes = (b'\x00\x00',  # on/off
@@ -66,7 +86,7 @@ class OnOffReadAttributeParts:
 
         :param on_off_state: True of on
         :type on_off_state: boolean
-        :param for_report: True if for report. this affects the "variable" component of ZCL. Reports do not have the status byte. Attr request responses DO
+        :param for_report: True if for report. this affects the ZCL. Reports do not have the status byte. Attr request responses DO
         """
         self.on_off_state = on_off_state
         self.for_report = for_report
@@ -99,6 +119,15 @@ def zcl_string(s):
     :return:
     """
     return b'\x42' + len(s).to_bytes(length=1, byteorder="big") + s.encode(encoding="ascii")
+
+
+def zcl_fcf_flip(fcf):
+    """
+    FLips direction of a frame-control field
+    :param fcf:
+    :return:
+    """
+    return (fcf[0] ^ 0x08).to_bytes(1, "big")  # direction is bit 3
 
 
 class ZclFrameCommand:
@@ -142,15 +171,6 @@ class ZclFrameResponse:
         :return: bytes
         """
         return self.zcl_header() + b''.join(self.variables)
-
-
-def zcl_fcf_flip(fcf):
-    """
-    FLips direction of a frame-control field
-    :param fcf:
-    :return:
-    """
-    return (fcf[0] ^ 0x08).to_bytes(1, "big")  # direction is bit 3
 
 
 class ZclFrameReadAttributes(ZclFrameCommand):
@@ -229,7 +249,7 @@ class AfIncomingMessage:
         """
         self.is_af_incoming_message = False
 
-        if f.command != b'\x44\x81':
+        if f.command != AF_INCOMING_MSG:
             return
         self.is_af_incoming_message = True
 
@@ -292,12 +312,6 @@ class ZnpFrameBody:  # i.e. the ZNP frame as sent over UART but without the SOF 
         return "Cmd: " + self.command.hex() + " Body: " + self.data.hex(sep=' ')
 
 
-# ZNP message command ids
-SYS_RESET_IND = b'\x41\x80'
-ZB_WRITE_CONFIGURATION_RSP = b'\x66\x05'
-ZB_SYSTEM_RESET = b'\x46\x09'
-
-
 def calc_append_fcs(msg):  # note that bytes objects are immutable
     """
     Append XOR8 checksum to message
@@ -340,10 +354,10 @@ def send_report(s, endpoint, cluster_provider, report_seq_no, print_msg=False):
     zcl = ZclFrameReport(cluster_provider, report_seq_no)
     data = zcl.zcl_message()
     # AF_DATA_REQUEST 0x2401 as for replies to attribute request, but without an "in" object to provide parameters
-    out_msg = (10 + len(data)).to_bytes(length=1, byteorder="big") + b'\x24\x01' + \
+    out_msg = (10 + len(data)).to_bytes(length=1, byteorder="big") + AF_DATA_REQUEST + \
         b'\x00\x00' + epb + epb + cluster_provider.cluster_id[::-1] + zcl.trans_seq_no + b'\x00' + b'\x10' + \
         len(data).to_bytes(length=1, byteorder="big") + data
-    rsp_success = send_and_check_success(s, out_msg, b'\x64\x01', print_msg=print_msg)
+    rsp_success = send_and_check_success(s, out_msg, AF_DATA_REQUEST_RSP, print_msg=print_msg)
     if print_msg:
         print("AF_DATA_REQUEST_RSP (for report) success?", rsp_success)
     return rsp_success
@@ -372,18 +386,18 @@ def zb_write_configuration(s, config_id, value, print_msg=False):
     :type s: Serial
     :param config_id:
     :type config_id: bytes
-    :param value:
+    :param value: bytes as sent in the message. i.e. likely to require little-endian form of multi-byte values
     :type value: bytes
     :param print_msg:
     :type print_msg: bool
     :return:
     """
     data_len = 2 + len(value)  # config-id + value-len + value
-    msg = data_len.to_bytes(length=1, byteorder='big') + b'\x26\x05' + config_id + len(value).to_bytes(length=1, byteorder="big") + value
+    msg = data_len.to_bytes(length=1, byteorder='big') + ZB_WRITE_CONFIGURATION + config_id + len(value).to_bytes(length=1, byteorder="big") + value
 
     return send_and_check_success(s,
                                   msg,
-                                  b'\x66\x05',  # ZB_WRITE_CONFIGURATION_RSP
+                                  ZB_WRITE_CONFIGURATION_RSP,
                                   prepend_sof=True,
                                   append_fcs=True,
                                   print_msg=print_msg)
@@ -416,14 +430,14 @@ def af_register(s,
     le_in_cluster_ids = [cid[::-1] for cid in in_cluster_ids]
     le_out_cluster_ids = [cid[::-1] for cid in out_cluster_ids]
     data_len = 9 + 2 * len(in_cluster_ids) + 2 * len(out_cluster_ids)
-    msg = data_len.to_bytes(length=1, byteorder='big') + b'\x24\x00' + \
+    msg = data_len.to_bytes(length=1, byteorder='big') + AF_REGISTER + \
         endpoint + app_prof_id[::-1] + app_device_id[::-1] + app_dev_ver + latency_req + \
         len(in_cluster_ids).to_bytes(length=1, byteorder="big") + b''.join(le_in_cluster_ids) + \
         len(out_cluster_ids).to_bytes(length=1, byteorder="big") + b''.join(le_out_cluster_ids)
 
     return send_and_check_success(s,
                                   msg,
-                                  b'\x64\x00',
+                                  AF_REGISTER_RSP,
                                   prepend_sof=True,
                                   append_fcs=True,
                                   print_msg=print_msg)

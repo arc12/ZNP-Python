@@ -1,23 +1,21 @@
 from serial import Serial
+from time import time
 import znp
 
 port = "COM7"
-do_setup = False
+do_setup = True
 
-# Code to interact with a device running the @KoenKK compiled Z-Stack HA 1.2 firmware. This is nominally "coordinator", in which guise is is the
+# Code to interact with a device running the @KoenKK compiled Z-Stack HA 1.2 firmware. This is nominally "coordinator", in which guise it is the
 # firmware recommended for Zigbee2MQTT coordinators running on CC2531 USB dongles.
 
 # expectation is that the serial adapter will be live but not necessarily the ZNP device
 S = Serial(port=port, baudrate=115200)  # default timeout is forever
 S.reset_input_buffer()
-# S.close()
-# exit(0)
+
 
 if do_setup:
     # --------- wait for device
     input("Reset or power-up ZNP then hit return. Will wait for SYS_RESET_IND")
-
-
     print("Waiting")
     f1 = znp.ZnpFrameBody(S)
     print(f1)
@@ -35,15 +33,27 @@ if do_setup:
                                              b'\x83',  # ZCD_NV_PAN_ID
                                              b'\xff\xff',  # "dont care" - tolerate whatever the coordinator has. Expected to be OK if only one PAN.
                                              print_msg=True)
-    # could set the channel mask here - use ZCD_NV_CHANLIST - but presume that the firmware defaults will be suitable (same firmware as coordinator)
-    # For tinkering, set ZCD_NV_STARTUP_OPTION to cause clear network state on restart. Otherwise the device will attempt to resume its network, which might be bollocks.
+    # set the channel mask here otherwise the preferred channel will be the compiled default, which is ch 11 (only). Coordinator likely to be set to a different
+    # channel to avoid WiFi interference. Setting is not essential, since the end device will try other channels until it finds a joinable PAN, but it does
+    # speed things up. The value is 4 bytes, as a bit mask with 1 meaning enabled, with the least significant bit being channel 0.
+    # i.e. channel 11 only is 0x00000800 (but this must be expressed in little-endian form for the ZNP message)
+    if success:
+        success = znp.zb_write_configuration(S,
+                                             b'\x84',  # ZCD_NV_CHANLIST
+                                             # 0b100000000000.to_bytes(4, "little"),  # ch 11
+                                             0b10000000000000000.to_bytes(4, "little"),  # ch 16
+                                             # 0b10000000000000000000.to_bytes(4, "little"),  # ch 19
+                                             print_msg=True)
+
+    # For tinkering, set ZCD_NV_STARTUP_OPTION to cause clear network state on restart.
+    # Otherwise the device will attempt to resume its network, which might be bollocks.
     if success:
         success = znp.zb_write_configuration(S,
                                              b'\x03',  # ZCD_NV_STARTUP_OPTION
                                              b'\x02',  # clear NV memory. Also possible to clear config settings.
                                              print_msg=True)
 
-    # >>> this modifies the ZCD_NV_POLL_RATE, which controls the interval with which the device contacts the coordinator with IEEE 802.15.4 "Data Request" packets
+    # This modifies the ZCD_NV_POLL_RATE, which controls the interval with which the device contacts the coordinator with IEEE 802.15.4 "Data Request" packets
     # (see Wireshark sniffer). The compiled default is 1000ms. THe documentation wrongly states this is config_id 0x24 and has byte length. It is actually
     # config_id = 0x35 and is a 4 byte value (in ms) expressed in little-endian form
     if success:
@@ -55,10 +65,10 @@ if do_setup:
     if not success:
         raise Exception("FAILED to write device basic configuration")
 
-    # ----------- issue a ZB_SYSTEM_RESET command to clear state
-    print("Resetting to clear network state.")
+    # ----------- issue a ZB_SYSTEM_RESET command to clear network state
+    print("\nResetting to clear network state...", end="")
     znp.command_no_data(S, znp.ZB_SYSTEM_RESET)  # ignore response frame (but this DOES wait for it)
-    print("Reset complete.")
+    print("Reset complete.\n")
 
     # ---------- Register the device and define the clusters. There is an alternative command in the Simple API. IDs here are big-endian
     znp.af_register(S,
@@ -101,19 +111,20 @@ if do_setup:
     # - ZDO_STARTUP_FROM_APP, which takes a parameter and returns a RSP with a network state byte
     input("MAKE SURE Zigbee2MQTT is accepting join requests and then hit any key. (Otherwise you get status=2 [searching for PAN] from ZDO_STATE_CHANGE_IND)")
     fr = znp.send_and_await_response(S,
-                                     b'\x01\x25\x40\x00',  # ZDO_STARTUP_FROM_APP with 0 delay
+                                     b'\x01' + znp.ZDO_STARTUP_FROM_APP + '\x00',  # ZDO_STARTUP_FROM_APP with 0 delay
                                      print_msg=True)  # this should cause a response 0x6540 with network state code + multiple ZDO_STATE_CHANGE_IND
     device_ready = False
     state_2_count = 0
     while not device_ready:
-        if fr.command == b'\x65\x40':
+        if fr.command == znp.ZDO_STARTUP_FROM_APP_RSP:
             print("Startup response: network status code = {}".format(fr.data[0].to_bytes(length=1, byteorder="big")))
-        elif fr.command == b'\x45\xC0':  # ZDO_STATE_CHANGE_IND
+        elif fr.command == znp.ZDO_STATE_CHANGE_IND:  # see devStates_t enum in Z-Stack Home 1.2\Components\stack\zdo\ZDApp.h
             state = fr.data[0]
-            if state == 2:
+            if state == 2:  # DEV_NWK_DISC
                 state_2_count += 1
+                print(".", end="")
             else:
-                print(f"State = {state}")
+                print(f"State = {state}")  # normally steps through 3 DEV_NWK_JOINING -> 5 DEV_END_DEVICE_UNAUTH -> 6 DEV_END_DEVICE
             device_ready = state == 6  # DEV_END_DEVICE
             if state_2_count > 20:
                 raise Exception("Excessive state=2 from ZDO_STATE_CHANGE_IND. Coordinator probably not accepting joins or off-line.")
@@ -126,7 +137,6 @@ if do_setup:
 # ------------- THIS IS WHERE Z2M Starts its interview, issuing multiple AF_INCOMING_MSG
 running = True
 # set up for reporting events at 10s intervals, LED change events at 7s intervals, and sw change events at 12s
-from time import time
 last_time_report = int(time() // 10) % 2
 last_time_led_event = int(time() // 7) % 2
 last_time_sw_event = int(time() // 12) % 2
@@ -192,10 +202,10 @@ while running:
 
             # AF_DATA_REQUEST 0x2401
             print("Sending response...")
-            out_msg = (10 + len(data)).to_bytes(length=1, byteorder="big") + b'\x24\x01' + \
+            out_msg = (10 + len(data)).to_bytes(length=1, byteorder="big") + znp.AF_DATA_REQUEST + \
                 in_msg.src_addr + in_msg.src_endpoint + in_msg.dst_endpoint + in_msg.cluster_id[::-1] + in_msg.transaction_seq_no + b'\x00' + b'\x10' +\
                 len(data).to_bytes(length=1, byteorder="big") + data
-            rsp_success = znp.send_and_check_success(S, out_msg, b'\x64\x01', print_msg=True)
+            rsp_success = znp.send_and_check_success(S, out_msg, znp.AF_DATA_REQUEST_RSP, print_msg=True)
             print("AF_DATA_REQUEST_RSP success?", rsp_success)  # ALSO likely to be AF_DATA_CONFIRM for request, in addition to AF_DATA_REQUEST response
         else:
             print("Unexpected message received:", f)
@@ -204,32 +214,24 @@ while running:
     time_report = int(time() // 10) % 2
     if time_report != last_time_report:
         last_time_report = time_report
+        print("--------------")
         print("Sending periodic report (AF_DATA_REQUEST) for endpoint 2 (LED)")
         # Only cluster 0x0006 but also note that these reports include LQI (as part of the metadata), which shows up in Z2M. No reports = no LQI!
         cluster_provider = znp.OnOffReadAttributeParts(led_state_onoff, for_report=True)
         znp.send_report(S, 2, cluster_provider, report_seq_no, print_msg=True)  # endpoint 2
-        # zcl = znp.ZclFrameReport(cluster_provider, report_seq_no)
-        # data = zcl.zcl_message()
-        # # AF_DATA_REQUEST 0x2401 again, but without an "in" object to provide parameters
-        # fixed_endpoint = b'\x01'
-        # out_msg = (10 + len(data)).to_bytes(length=1, byteorder="big") + b'\x24\x01' + \
-        #     b'\x00\x00' + fixed_endpoint + fixed_endpoint + cluster_provider.cluster_id[::-1] + zcl.trans_seq_no + b'\x00' + b'\x10' + \
-        #     len(data).to_bytes(length=1, byteorder="big") + data
-        # rsp_success = znp.send_and_check_success(S, out_msg, b'\x64\x01', print_msg=True)
-        # print("AF_DATA_REQUEST_RSP success?", rsp_success)
         report_seq_no += 1
 
     time_led_event = int(time() // 7) % 2
     if time_led_event != last_time_led_event:
         last_time_led_event = time_led_event
         led_state_onoff = not led_state_onoff
-        print("LED changed to:  " + ("on" if led_state_onoff else "off"))
+        print("-----\n\tLED changed to:  " + ("on" if led_state_onoff else "off"))
 
     time_sw_event = int(time() // 12) % 2
     if time_sw_event != last_time_sw_event:
         last_time_sw_event = time_sw_event
         sw_state_onoff = not sw_state_onoff
-        print("Sw changed to:  " + ("on" if sw_state_onoff else "off"))
+        print("-----\n\tSw changed to:  " + ("on" if sw_state_onoff else "off"))
         # the switch reports each state change (on and off) when they happen. (see above, there is no periodic report for endpoint 1)
         cluster_provider = znp.OnOffReadAttributeParts(sw_state_onoff, for_report=True)
         znp.send_report(S, 1, cluster_provider, report_seq_no, print_msg=True)  # endpoint 1
