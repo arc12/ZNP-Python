@@ -2,8 +2,10 @@ from serial import Serial
 from time import time
 import znp
 
-port = "COM7"
+port = "COM4"
+# control which sections of code run - see the "ifs".
 do_setup = True
+with_activity = True  # simulated activity and periodic reports
 
 # Code to interact with a device running the @KoenKK compiled Z-Stack HA 1.2 firmware. This is nominally "coordinator", in which guise it is the
 # firmware recommended for Zigbee2MQTT coordinators running on CC2531 USB dongles.
@@ -47,6 +49,7 @@ if do_setup:
 
     # For tinkering, set ZCD_NV_STARTUP_OPTION to cause clear network state on restart.
     # Otherwise the device will attempt to resume its network, which might be bollocks.
+    # For a production device, a value of 4 might be appropriate = auto-start. The default of 0 means an explicit network start is required.
     if success:
         success = znp.zb_write_configuration(S,
                                              b'\x03',  # ZCD_NV_STARTUP_OPTION
@@ -71,6 +74,19 @@ if do_setup:
     print("Reset complete.\n")
 
     # ---------- Register the device and define the clusters. There is an alternative command in the Simple API. IDs here are big-endian
+    # A >> simple case for Basic Cluster only - to show Z2M interview working. Use A or B, not both!
+    # if using this option, with_activity should be set to False.
+    # znp.af_register(S,
+    #                 endpoint=b'\x01',
+    #                 app_prof_id=b'\x01\x04',  # Home Automation Profile (prescribed) = 260 decimal
+    #                 app_device_id=b'\x00\x00',  # Device ID also in the HA Profile spec - this is the On/Off switch Id
+    #                 app_dev_ver=b'\x01',  # I think the device version is not prescribed
+    #                 in_cluster_ids=(  # this is a tuple
+    #                     b'\x00\x00',  # Basic Cluster, which is device info such as name, manufacturer etc
+    #                 ),
+    #                 print_msg=True
+    #                 )
+    # # B >> "full" setup with LED and switch. Use A or B, not both!
     znp.af_register(S,
                     endpoint=b'\x01',
                     app_prof_id=b'\x01\x04',  # Home Automation Profile (prescribed) = 260 decimal
@@ -110,8 +126,9 @@ if do_setup:
     # - ZB_START_REQUEST (0x2600) [Simple API], which takes no parameters and returns a plain (no data) ZB_START_REQUEST_RSP (0x6600) immediately, and
     # - ZDO_STARTUP_FROM_APP, which takes a parameter and returns a RSP with a network state byte
     input("MAKE SURE Zigbee2MQTT is accepting join requests and then hit any key. (Otherwise you get status=2 [searching for PAN] from ZDO_STATE_CHANGE_IND)")
+    print()
     fr = znp.send_and_await_response(S,
-                                     b'\x01' + znp.ZDO_STARTUP_FROM_APP + '\x00',  # ZDO_STARTUP_FROM_APP with 0 delay
+                                     b'\x01' + znp.ZDO_STARTUP_FROM_APP + b'\x00',  # ZDO_STARTUP_FROM_APP with 0 delay
                                      print_msg=True)  # this should cause a response 0x6540 with network state code + multiple ZDO_STATE_CHANGE_IND
     device_ready = False
     state_2_count = 0
@@ -210,31 +227,32 @@ while running:
         else:
             print("Unexpected message received:", f)
 
-    # output event or make report
-    time_report = int(time() // 10) % 2
-    if time_report != last_time_report:
-        last_time_report = time_report
-        print("--------------")
-        print("Sending periodic report (AF_DATA_REQUEST) for endpoint 2 (LED)")
-        # Only cluster 0x0006 but also note that these reports include LQI (as part of the metadata), which shows up in Z2M. No reports = no LQI!
-        cluster_provider = znp.OnOffReadAttributeParts(led_state_onoff, for_report=True)
-        znp.send_report(S, 2, cluster_provider, report_seq_no, print_msg=True)  # endpoint 2
-        report_seq_no += 1
+    if with_activity:
+        # output event or make report
+        time_report = int(time() // 10) % 2
+        if time_report != last_time_report:
+            last_time_report = time_report
+            print("--------------")
+            print("Sending periodic report (AF_DATA_REQUEST) for endpoint 2 (LED)")
+            # Only cluster 0x0006 but also note that these reports include LQI (as part of the metadata), which shows up in Z2M. No reports = no LQI!
+            cluster_provider = znp.OnOffReadAttributeParts(led_state_onoff, for_report=True)
+            znp.send_report(S, 2, cluster_provider, report_seq_no, print_msg=True)  # endpoint 2
+            report_seq_no += 1
 
-    time_led_event = int(time() // 7) % 2
-    if time_led_event != last_time_led_event:
-        last_time_led_event = time_led_event
-        led_state_onoff = not led_state_onoff
-        print("-----\n\tLED changed to:  " + ("on" if led_state_onoff else "off"))
+        time_led_event = int(time() // 7) % 2
+        if time_led_event != last_time_led_event:
+            last_time_led_event = time_led_event
+            led_state_onoff = not led_state_onoff
+            print("-----\n\tLED changed to:  " + ("on" if led_state_onoff else "off"))
 
-    time_sw_event = int(time() // 12) % 2
-    if time_sw_event != last_time_sw_event:
-        last_time_sw_event = time_sw_event
-        sw_state_onoff = not sw_state_onoff
-        print("-----\n\tSw changed to:  " + ("on" if sw_state_onoff else "off"))
-        # the switch reports each state change (on and off) when they happen. (see above, there is no periodic report for endpoint 1)
-        cluster_provider = znp.OnOffReadAttributeParts(sw_state_onoff, for_report=True)
-        znp.send_report(S, 1, cluster_provider, report_seq_no, print_msg=True)  # endpoint 1
-        report_seq_no += 1
+        time_sw_event = int(time() // 12) % 2
+        if time_sw_event != last_time_sw_event:
+            last_time_sw_event = time_sw_event
+            sw_state_onoff = not sw_state_onoff
+            print("-----\n\tSw changed to:  " + ("on" if sw_state_onoff else "off"))
+            # the switch reports each state change (on and off) when they happen. (see above, there is no periodic report for endpoint 1)
+            cluster_provider = znp.OnOffReadAttributeParts(sw_state_onoff, for_report=True)
+            znp.send_report(S, 1, cluster_provider, report_seq_no, print_msg=True)  # endpoint 1
+            report_seq_no += 1
 
 S.close()
